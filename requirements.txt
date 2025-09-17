@@ -1,0 +1,23 @@
+streamlit
+requests
+neo4j
+pandas
+sentence-transformers
+neo4j-graphrag
+openai
+chromadb
+numpy<2.0.0
+fsspec<=2024.3.1
+ollama
+langchain
+langchain-community
+
+# === PubMed + Europe PMC ===
+biopython>=1.83
+beautifulsoup4>=4.12.3
+requests>=2.31.0
+tqdm>=4.66.4
+
+lxml
+beautifulsoup4
+
