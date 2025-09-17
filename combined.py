@@ -15,6 +15,13 @@ import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 import asyncio
+import time  # ▶︎ 用於計時
+import hashlib
+from datetime import datetime, timedelta
+import chromadb
+
+# ====================== 可調參數 ======================
+TOP_N_PAPERS = 5  # ▶︎ PapersRAG 最多引用的論文篇數（可自行改成 10 等）
 
 # ========== Streamlit UI ==========
 st.set_page_config(page_title="Medical RAG System", layout="wide")
@@ -29,7 +36,7 @@ managing_model = st.selectbox(
 )
 cypher_model = st.selectbox(
     "選擇 Cypher 查詢模型",
-    ["llama3", "mistral", "gemma:7b", "qwen2:7b", "gpt-oss"]
+    ["gpt-oss"]
 )
 answer_model = st.selectbox(
     "選擇 回答生成模型",
@@ -49,8 +56,11 @@ def init_graph(cypher_model_name, answer_model_name):
 
 driver, cypher_llm, answer_llm, retriever = init_graph(cypher_model, answer_model)
 
+def get_session():
+    return driver.session(database="neo4j")
+
 # ========== PubMed Utility Functions ==========
-Entrez.email = "youremail@gmail.com"  # TODO: Replace with your email
+Entrez.email = "email@gmail.com"  # TODO: Replace with your email
 
 def search_pubmed(keyword, max_results=20):
     handle = Entrez.esearch(db="pubmed", term=keyword, retmax=max_results, sort="relevance")
@@ -105,7 +115,6 @@ def retrieve_papers(keyword, max_results=20):
         papers.append(entry)
     return papers
 
-import re
 
 # 簡單停用字，可自行擴充
 _STOPWORDS = set("""
@@ -119,7 +128,7 @@ def _clean_phrase(s: str) -> str:
 
 def derive_core_terms(user_query: str) -> list[str]:
     """
-    從使用者 query 動態抽主題詞（疾病 / 主體），作為 must terms 與 PubMed 查詢核心。
+    從使用者 query 動態抽主題詞（疾病 / 主體），作為 must terms。
     規則：
     - 先抓引號中的片語
     - 沒有引號則取長度 >= 3 的關鍵詞，去停用字
@@ -148,8 +157,6 @@ def contains_any(text: str, terms: list[str]) -> bool:
     return any(term.lower() in t for term in terms)
 
 # ========== PapersRAG RAG Helpers  ==========
-
-# 可選套件：若已安裝會啟用；未安裝則自動降級
 try:
     from sentence_transformers import SentenceTransformer, CrossEncoder
     _emb_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
@@ -163,16 +170,12 @@ try:
 except Exception:
     BM25Okapi = None
 
-import math
 import unicodedata
 
 def _normalize_ws(s: str) -> str:
     return " ".join(s.split())
 
 def _chunk_text(text: str, max_chars: int = 1800, overlap: int = 200):
-    """
-    簡單用字元長度切塊（保守估約 1.2–1.6 chars/token）。
-    """
     text = _normalize_ws(text)
     if not text:
         return []
@@ -188,14 +191,19 @@ def _chunk_text(text: str, max_chars: int = 1800, overlap: int = 200):
         start = max(0, end - overlap)
     return chunks
 
+def _split_sentences(text: str) -> list[str]:
+    """
+    用簡單規則把段落切成句子。
+    英文依據 ., ?, ! 後加空白分句；中文依據 。！？。
+    """
+    import re
+    text = text.stript()
+    if not text:
+        return []
+    sentences = re.split(r'(?<=[。！？!?\.])\s+', text)
+    return [s.strip() for s in sentences if s.strip()]
+
 def build_chunks_from_entry(entry: dict):
-    """
-    把單篇論文 entry 轉為 RAG 可用的 chunks。
-    來源：
-      - fulltext.abstract
-      - fulltext.body (每段落)
-      - 無全文時，至少用 title 當線索
-    """
     chunks = []
     pmid = entry.get("pmid")
     title = entry.get("title", "")
@@ -203,45 +211,37 @@ def build_chunks_from_entry(entry: dict):
 
     # 摘要
     if entry.get("fulltext", {}).get("abstract"):
-        for i, ch in enumerate(_chunk_text(entry["fulltext"]["abstract"])):
+        for i, ch in enumerate(_split_sentences(entry["fulltext"]["abstract"])):
             chunks.append({
                 "pmid": pmid, "title": title, "where": "abstract",
-                "chunk_id": f"abs-{i}", "text": ch, "pubmed_url": url
+                "chunk_id": f"abs-s{i}", "text": ch, "pubmed_url": url
             })
 
     # 正文
     if entry.get("fulltext", {}).get("body"):
         for j, para in enumerate(entry["fulltext"]["body"]):
-            para = _normalize_ws(para)
-            if not para:
-                continue
-            # 你原本沒有 section 名稱，這裡直接標 body
-            for i, ch in enumerate(_chunk_text(para)):
+            for i, ch in enumerate(_split_sentences(para)):
                 chunks.append({
                     "pmid": pmid, "title": title, "where": "body",
-                    "chunk_id": f"p{j}-{i}", "text": ch, "pubmed_url": url
+                    "chunk_id": f"p{j}-s{i}", "text": ch, "pubmed_url": url
                 })
 
     # 沒有全文時，至少用 title
-    if not chunks:
-        if title.strip():
-            chunks.append({
-                "pmid": pmid, "title": title, "where": "title",
-                "chunk_id": "t-0", "text": title.strip(), "pubmed_url": url
-            })
+    if not chunks and title.strip():
+        chunks.append({
+            "pmid": pmid, "title": title, "where": "title",
+            "chunk_id": "t-0", "text": title.strip(), "pubmed_url": url
+        })
 
     return chunks
 
 def _tokenize_for_bm25(txt: str):
-    # 很鬆的英文 token 化；中文以字元切
     txt = unicodedata.normalize("NFKC", txt.lower())
-    # 留下字母數字與空白
     cleaned = []
     for ch in txt:
         if ch.isalnum() or ch.isspace():
             cleaned.append(ch)
         else:
-            # 中文 / 其他語系：直接視為 token
             if ord(ch) > 127 and not ch.isspace():
                 cleaned.append(f" {ch} ")
     return " ".join("".join(cleaned).split()).split()
@@ -260,11 +260,9 @@ class PapersMiniIndex:
         self._dense = None
         self._bm25 = None
 
-        # Dense embeddings（可選）
         if _emb_model is not None and self.docs:
             self._dense = _emb_model.encode(self.docs, show_progress_bar=False, normalize_embeddings=True)
 
-        # BM25（可選）
         if BM25Okapi is not None and self.docs:
             self._bm25 = BM25Okapi([_tokenize_for_bm25(d) for d in self.docs])
 
@@ -273,14 +271,11 @@ class PapersMiniIndex:
 
         # Dense 相似度
         if self._dense is not None:
-            q = _emb_model.encode([query], show_progress_bar=False, normalize_embeddings=True)[0]
-            # 餘弦相似度
             import numpy as np
+            q = _emb_model.encode([query], show_progress_bar=False, normalize_embeddings=True)[0]
             dense_scores = np.dot(self._dense, q)
-            # 取 top_k_dense
             idxs = dense_scores.argsort()[-top_k_dense:][::-1]
             ds = dense_scores[idxs]
-            # normalize 到 0..1
             if len(ds) > 1:
                 ds_norm = (ds - ds.min()) / (ds.max() - ds.min() + 1e-9)
             else:
@@ -290,8 +285,8 @@ class PapersMiniIndex:
 
         # BM25 分數
         if self._bm25 is not None:
-            bm25 = self._bm25.get_scores(_tokenize_for_bm25(query))
             import numpy as np
+            bm25 = self._bm25.get_scores(_tokenize_for_bm25(query))
             idxs = bm25.argsort()[-top_k_bm25:][::-1]
             bs = bm25[idxs]
             if len(bs) > 1:
@@ -299,7 +294,6 @@ class PapersMiniIndex:
             else:
                 bs_norm = bs
             for i, s in zip(idxs, bs_norm):
-                # 取最大（dense / bm25）作為 hybrid 簡單融合
                 scores[i] = max(scores.get(i, 0.0), float(s))
 
         # 如果兩者都沒有，就用關鍵詞命中數
@@ -310,15 +304,11 @@ class PapersMiniIndex:
                 if hit:
                     scores[i] = float(hit)
 
-        # 按分數排序
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         hits = [{"text": self.docs[i], "meta": self.metas[i], "score": s} for i, s in ranked]
         return hits
 
 def rerank_hits(query: str, hits: list[dict], top_k: int = 8):
-    """
-    可選重排：若有 CrossEncoder 就用；否則直接取前 top_k。
-    """
     if not hits:
         return []
     if _reranker is None:
@@ -331,9 +321,6 @@ def rerank_hits(query: str, hits: list[dict], top_k: int = 8):
     return hits
 
 def make_cited_context(hits: list[dict]) -> str:
-    """
-    把命中片段轉為 LLM 可吃的帶編號引文區塊。
-    """
     blocks = []
     for i, h in enumerate(hits, 1):
         m = h["meta"]
@@ -348,7 +335,6 @@ def make_cited_context(hits: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 def filter_chunks_by_terms(chunks: list[dict], must_terms: list[str]) -> list[dict]:
-    """在切塊後立即先過濾一次（降低後續噪音）。"""
     if not must_terms:
         return chunks
     out = []
@@ -358,7 +344,6 @@ def filter_chunks_by_terms(chunks: list[dict], must_terms: list[str]) -> list[di
     return out
 
 def filter_hits_by_terms(hits: list[dict], must_terms: list[str]) -> list[dict]:
-    """在檢索與重排後再過濾一次，確保最後進 LLM 的片段都含主題詞。"""
     if not must_terms:
         return hits
     out = []
@@ -366,26 +351,37 @@ def filter_hits_by_terms(hits: list[dict], must_terms: list[str]) -> list[dict]:
         if contains_any(h.get("text",""), must_terms) or contains_any(h.get("meta",{}).get("title",""), must_terms):
             out.append(h)
     return out
- 
+
 # ========== Final Answer Synthesizer ==========
 def synthesize_answer(query, graph_context, papers_context, model):
     llm = Ollama(model=model, temperature=0, base_url="http://localhost:11434")
     prompt = PromptTemplate(
         input_variables=["question", "graph", "papers"],
-        template="""根據以下兩種來源，生成一個完整且專業的醫學回答：
-        
-        來源1 (GraphRAG 知識圖譜):
-        {graph}
+        template="""
+你是一個醫學助理，請根據以下來源產生回答。務必遵守以下規則：
 
-        來源2 (PapersRAG 最新醫學文獻):
-        {papers}
+1. 僅能使用來源1 (GraphRAG) 和來源2 (PapersRAG) 提供的內容，不要自行新增任何額外知識。
+2. 整理來源中的有用資訊，避免重複，但要盡可能涵蓋所有正確的細節。
+3. 如果引用 來源1，請標註「[GraphRAG]」，並只用節點與關係資訊。
+4. 如果引用 來源2，請標註 PMID，並直接引用來源中出現的段落文字或數據。
+   - 格式範例：根據 PMID: 123456 的研究，藥物 X 可改善氣喘控制。
+   - 不要生成或修改來源中未出現的文獻。
+5. 若同時有兩個來源，請先整理 GraphRAG 的結構化知識，再整理 PapersRAG 的研究結果，最後做簡短綜合。
+6. 保持專業、客觀、精簡，避免誇大或臆測。
 
-        問題：
-        {question}
-        
-        請僅引用 來源2 提供的 PMID 與段落，不要自行生成或捏造參考文獻。
-        請整合以上資料，生成專業醫學回答。
-        """
+---
+
+來源1 (GraphRAG 知識圖譜):
+{graph}
+
+來源2 (PapersRAG 最新醫學文獻):
+{papers}
+
+問題：
+{question}
+
+請依規則，整理出最終回答。
+"""
     )
     chain = LLMChain(llm=llm, prompt=prompt)
     return chain.run(question=query, graph=graph_context, papers=papers_context)
@@ -403,9 +399,6 @@ class QueryPlan(BaseModel):
     tasks: List[SubQuery]
 
 def create_query_plan(query, llm_model):
-    """
-    Use LLM to break down the user's query into sub-queries and decide which agent should handle each.
-    """
     llm = Ollama(model=llm_model, temperature=0, base_url="http://localhost:11434")
     parser = PydanticOutputParser(pydantic_object=QueryPlan)
     prompt = PromptTemplate(
@@ -415,7 +408,7 @@ def create_query_plan(query, llm_model):
 你是一個醫學多代理系統的任務管理代理，負責將複雜的醫學問題拆解為子問題，並指派給不同的專家代理：
 
 - GraphRAG Agent: 適合查詢結構化生物醫學知識圖譜。
-- PapersRAG Agent: 適合查詢最新醫學文獻。
+- PapersRAG Agent: 適合查詢最新醫學文獻，請特別注意指派給他的問題只能是英文，如果是中文或其他語言的話，請先翻譯成英文再指派。
 
 對以下問題進行分析，產生一個 JSON 格式的任務計畫，格式必須為：
 {format_instructions}
@@ -428,62 +421,140 @@ def create_query_plan(query, llm_model):
     output = chain.run(question=query)
     return parser.parse(output)
 
-# ========== Main Logic ==========
+# ===== Main Logic =====
 if submit and query:
+    overall_t0 = time.perf_counter()
     with st.spinner("正在進行多代理協作查詢..."):
         try:
-            # Step 1. Create task plan
+            # Step 1. Create task plan（計時）
+            tm_t0 = time.perf_counter()
             plan = create_query_plan(query, managing_model)
-            st.info("🤖 Managing Agent 建立的查詢計畫：")
-            st.json(plan.dict())
+            tm_t1 = time.perf_counter()
 
-            graph_context = ""
-            papers_context = ""
+            st.info("🤖 Managing Agent 建立的查詢計畫：")
+            st.json(plan.model_dump())
+            st.caption(f"⏱️ Managing Agent 用時：{tm_t1 - tm_t0:.2f} s")
+
+            graph_context = ""  # ← 初始化 GraphRAG 上下文
+            papers_context = "" # ← 初始化 PapersRAG 上下文
 
             # Step 2. Execute subtasks
             for task in plan.tasks:
                 st.write(f"🔹 處理子問題: **{task.subquery}** → 指派給 **{task.agent}**")
 
                 if task.agent == "GraphRAG":
+                    gr_t0 = time.perf_counter()
                     results = retriever.search(query_text=task.subquery)
                     if results:
-                        parsed_records = []
-                        for cypher_query, result_data in results:
+                        st.subheader("📄 Cypher 查詢與結果")
+                        for idx, (cypher_query, result_data) in enumerate(results):
+                            st.markdown(f"##### 🔎 Result {idx + 1}")
+                            st.code(cypher_query, language="cypher")
+
+                            # 將結果整理成 context_text，改成累加到 graph_context
                             if isinstance(result_data, list):
+                                parsed_records = []
                                 for record in result_data:
-                                    content = getattr(record, "content", None)
-                                    if not content:
+                                    if not hasattr(record, 'content') or record.content is None:
                                         continue
+                                    content = record.content
+
+                                    # 解析 properties
                                     match = re.search(r"properties=\{(.+?)\}", content)
                                     if match:
-                                        props = ast.literal_eval(f"{{{match.group(1)}}}")
-                                        parsed_records.append(props)
+                                        properties_str = match.group(1)
+                                        try:
+                                            props = ast.literal_eval(f"{{{properties_str}}}")
+                                            parsed_records.append(props)
+                                        except:
+                                            parsed_records.append({'result': content})
                                     else:
-                                        parsed_records.append({"result": content})
-                        if parsed_records:
-                            graph_context += f"\n### 子問題: {task.subquery}\n" + "\n".join([str(r) for r in parsed_records])
-                            st.subheader("📊 GraphRAG 子查詢結果")
-                            st.dataframe(pd.DataFrame(parsed_records))
+                                        try:
+                                            content_dict = ast.literal_eval(content)
+                                            if isinstance(content_dict, dict):
+                                                parsed_records.append(content_dict)
+                                            else:
+                                                parsed_records.append({'result': content_dict})
+                                        except:
+                                            parsed_records.append({'result': content})
+
+                                if parsed_records:
+                                    df = pd.DataFrame(parsed_records)
+                                    st.dataframe(df)
+                                    graph_context += "\n".join([str(r) for r in parsed_records]) + "\n"
+
+                            elif isinstance(result_data, dict):
+                                st.json(result_data)
+                                graph_context += str(result_data) + "\n"
+                    # === Embedding-based 檢索 ===
+                    try:
+                        import torch
+                        from sentence_transformers import SentenceTransformer
+
+                        # 自動偵測可用 device
+                        if torch.cuda.is_available():
+                            device = "cuda"
+                        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                            device = "mps"   # Apple Silicon
                         else:
-                            st.warning(f"GraphRAG 對子問題 '{task.subquery}' 未找到結果")
+                            device = "cpu"
+
+                        st.caption(f"🔍 Embedding 檢索裝置：{device}")
+
+                        embedding_model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
+                        query_vec = embedding_model.encode(task.subquery).tolist()
+
+                        with driver.session() as session:
+                            result = session.run(
+                                """
+                                WITH $queryVec AS queryVec
+                                CALL db.index.vector.queryNodes(
+                                    'drug_embedding_index', 5, queryVec
+                                ) YIELD node, score
+                                RETURN node.node_index AS id, node.indication AS indication, score
+                                ORDER BY score DESC
+                                """,
+                                queryVec=query_vec,
+                            )
+                            embed_records = [dict(record) for record in result]
+
+                        if embed_records:
+                            st.subheader("📊 GraphRAG Embedding 查詢結果")
+                            df_embed = pd.DataFrame(embed_records)
+                            st.dataframe(df_embed)
+                            graph_context += "\n".join([str(r) for r in embed_records]) + "\n"
+
+                    except Exception as e:
+                        st.warning(f"⚠️ Embedding 檢索失敗: {e}")
+                    gr_t1 = time.perf_counter()
+                    st.caption(f"⏱️ GraphRAG 子任務用時：{gr_t1 - gr_t0:.2f} s")
 
                 elif task.agent == "PapersRAG":
-                    # A) 由子問題動態產生 must terms（只用於過濾片段，不重組 PubMed 查詢）
+                    pr_t0 = time.perf_counter()
+
+                    # A) must terms（僅用於過濾）
                     must_terms = derive_core_terms(task.subquery)
 
-                    # B) 直接用原始子問題丟給 PubMed
+                    # B) PubMed 檢索
+                    t_pubmed_0 = time.perf_counter()
                     raw_query = task.subquery
                     papers = retrieve_papers(raw_query, max_results=30)
+                    t_pubmed_1 = time.perf_counter()
+                    st.caption(f"⏱️ PubMed 檢索：{t_pubmed_1 - t_pubmed_0:.2f} s，取得 {len(papers)} 篇")
 
                     if not papers:
                         st.warning(f"PapersRAG 對子問題 '{task.subquery}' 未找到相關論文")
                     else:
-                        # C) 切塊 → 先做一次主題詞過濾（可保留也可拿掉，建議保留以避免離題）
+                        # C) 切塊與初過濾
+                        t_chunk_0 = time.perf_counter()
                         all_chunks = []
                         for p in papers:
                             all_chunks.extend(build_chunks_from_entry(p))
-
                         filtered_chunks = filter_chunks_by_terms(all_chunks, must_terms)
+                        t_chunk_1 = time.perf_counter()
+                        st.caption(
+                            f"⏱️ 切塊 + 初步過濾：{t_chunk_1 - t_chunk_0:.2f} s，chunks：{len(all_chunks)} → {len(filtered_chunks)}"
+                        )
 
                         if not filtered_chunks:
                             st.subheader("📄 PapersRAG 子查詢結果")
@@ -496,13 +567,24 @@ if submit and query:
                                 + "\n\n(注意：此子問題在候選片段中未找到包含主題詞的內容。)"
                             )
                         else:
-                            # D) 檢索與重排
+                            # D) 檢索
+                            t_search_0 = time.perf_counter()
                             index = PapersMiniIndex(filtered_chunks)
                             hits = index.search(task.subquery, top_k_dense=12, top_k_bm25=12)
-                            hits = rerank_hits(task.subquery, hits, top_k=8)
+                            t_search_1 = time.perf_counter()
+                            st.caption(f"⏱️ Hybrid 檢索：{t_search_1 - t_search_0:.2f} s，命中 {len(hits)} 個片段")
 
-                            # E) 最終再過濾一次（保守做法，確保送進 LLM 的片段都含主題詞）
+                            # E) 精排
+                            t_rerank_0 = time.perf_counter()
+                            hits = rerank_hits(task.subquery, hits, top_k=64)  # 先保留較多，方便選前 N 篇
+                            t_rerank_1 = time.perf_counter()
+                            st.caption(f"⏱️ 精排（CrossEncoder 或 Top-K）：{t_rerank_1 - t_rerank_0:.2f} s，保留 {len(hits)} 片段")
+
+                            # F) 終過濾（確保含主題詞）
+                            t_filter_0 = time.perf_counter()
                             hits = filter_hits_by_terms(hits, must_terms)
+                            t_filter_1 = time.perf_counter()
+                            st.caption(f"⏱️ 命中後過濾：{t_filter_1 - t_filter_0:.2f} s，剩 {len(hits)} 片段")
 
                             if not hits:
                                 st.subheader("📄 PapersRAG 子查詢結果")
@@ -515,12 +597,31 @@ if submit and query:
                                     + "\n\n(注意：RAG 片段經主題詞過濾後為空。)"
                                 )
                             else:
-                                # F) 組裝帶編號引文 context
-                                cited_context = make_cited_context(hits)
+                                # G) 只取前 N 篇論文（依片段排序抽取唯一 PMID）
+                                t_pick_0 = time.perf_counter()
+                                ordered_pmids = []
+                                for h in hits:
+                                    pmid = h["meta"].get("pmid")
+                                    if pmid and pmid not in ordered_pmids:
+                                        ordered_pmids.append(pmid)
+                                    if len(ordered_pmids) >= int(TOP_N_PAPERS):
+                                        break
+                                selected_set = set(ordered_pmids)
+                                selected_hits = [h for h in hits if h["meta"].get("pmid") in selected_set]
+                                t_pick_1 = time.perf_counter()
+                                st.caption(
+                                    f"⏱️ 擷取前 {int(TOP_N_PAPERS)} 篇：{t_pick_1 - t_pick_0:.2f} s，最終片段數 {len(selected_hits)}，論文數 {len(selected_set)}"
+                                )
+
+                                # H) 組裝引文 context
+                                t_ctx_0 = time.perf_counter()
+                                cited_context = make_cited_context(selected_hits)
+                                t_ctx_1 = time.perf_counter()
+                                st.caption(f"⏱️ 引文組裝：{t_ctx_1 - t_ctx_0:.2f} s")
 
                                 # UI 顯示
-                                st.subheader("📄 PapersRAG 子查詢結果（RAG）")
-                                for i, h in enumerate(hits, 1):
+                                st.subheader(f"📄 PapersRAG 子查詢結果（取前 {int(TOP_N_PAPERS)} 篇）")
+                                for i, h in enumerate(selected_hits, 1):
                                     m = h["meta"]
                                     pmid = m.get("pmid", "NA")
                                     where = m.get("where", "")
@@ -533,13 +634,22 @@ if submit and query:
                                     )
                                     st.write(h["text"][:500] + ("..." if len(h["text"]) > 500 else ""))
 
-                                # G) 交給最終生成器使用
+                                # I) 交給最終生成器使用
                                 papers_context += f"\n### 子問題: {task.subquery}\n" + cited_context
 
-            # Step 3. Final synthesis
+                    pr_t1 = time.perf_counter()
+                    st.caption(f"⏱️ PapersRAG 子任務用時：{pr_t1 - pr_t0:.2f} s")
+
+            # Step 3. Final synthesis（計時）
+            t_synth_0 = time.perf_counter()
             final_answer = synthesize_answer(query, graph_context, papers_context, answer_model)
+            t_synth_1 = time.perf_counter()
             st.subheader("💬 最終回答")
             st.success(final_answer)
+            st.caption(f"⏱️ 最終答案生成：{t_synth_1 - t_synth_0:.2f} s")
+
+            overall_t1 = time.perf_counter()
+            st.caption(f"⏱️ 總用時：{overall_t1 - overall_t0:.2f} s")
 
         except Exception as e:
-            st.error(f"❌ 發生錯誤：{e}") # 轉 cypher 滿容易轉錯的，要是轉錯就會直接停掉，要改一下邏輯
+            st.error(f"❌ 發生錯誤：{e}")  # 轉 Cypher 滿容易轉錯的，要是轉錯就會直接停掉，要改一下邏輯
